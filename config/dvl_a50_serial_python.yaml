@@ -1,0 +1,15 @@
+/**:
+  ros__parameters:
+    port: "/dev/dvl"
+    baud_rate: 115200
+    frame: "dvl_a50_link"
+    enable_on_activate: true
+    speed_of_sound: 1500.0
+    led_enabled: true
+    mounting_rotation_offset: 0.0
+    range_mode: "auto"
+    periodic_cycling_enabled: true
+    
+    topic_velocity: "velocity"
+    topic_dead_reckoning: "dead_reckoning"
+    topic_odometry: "odometry"
