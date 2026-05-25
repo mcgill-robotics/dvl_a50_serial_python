@@ -8,7 +8,7 @@ import time
 import math
 from std_srvs.srv import Trigger
 from rcl_interfaces.msg import SetParametersResult
-from .dvl_parser import verify_checksum, parse_wrz, parse_wru, parse_wrp, parse_wrv, parse_wrc
+from .dvl_parser import verify_checksum, parse_wrz, parse_wru, parse_wrp, parse_wrv, parse_wrc, parse_wrw, crc8_func
 
 from dvl_msgs.msg import DVL, DVLDR, DVLBeam
 from dvl_msgs.srv import GetConfig
@@ -31,11 +31,11 @@ class DvlSerialPythonNode(Node):
         self.declare_parameter('topic_velocity', 'velocity')
         self.declare_parameter('topic_dead_reckoning', 'dead_reckoning')
         self.declare_parameter('topic_odometry', 'odometry')
-        self.declare_parameter('timeout_configure_ms', 5000)
+        self.declare_parameter('timeout_configure_ms', 1000)
         self.declare_parameter('timeout_reset_dead_reckoning_ms', 5000)
         self.declare_parameter('timeout_calibrate_gyro_ms', 20000)
         self.declare_parameter('timeout_trigger_ping_ms', 5000)
-        self.declare_parameter('timeout_set_protocol_ms', 5000)
+        self.declare_parameter('timeout_set_protocol_ms', 1000)
         self.declare_parameter('timeout_get_config_ms', 5000)
         
         port = self.get_parameter('port').value
@@ -84,8 +84,11 @@ class DvlSerialPythonNode(Node):
             try:
                 self.serial = serial.Serial(port, baud_rate, timeout=0.1)
                 success = True
+                self.get_logger().info("Port opened. Waiting 2 seconds for USB serial chip initialization...")
+                time.sleep(2.0)
                 break
             except Exception as e:
+                self.get_logger().warn(f"Connection attempt failed: {e}")
                 time.sleep(1.0)
                 
         if not success:
@@ -93,8 +96,9 @@ class DvlSerialPythonNode(Node):
             return
             
         self.running = True
-        self.ack_event = threading.Event()
-        self.nak_event = threading.Event()
+        self.wait_for_ack = False
+        self.command_success = False
+        self.command_event = threading.Event()
         self.wrc_event = threading.Event()
         self.wrc_data = None
         
@@ -107,7 +111,7 @@ class DvlSerialPythonNode(Node):
 
     def reset_dr_callback(self, request, response):
         self.get_logger().info("Resetting dead reckoning...")
-        return self._trigger_command(b"wcr\n", self.timeout_reset_dr, response)
+        return self._trigger_command("wcr", self.timeout_reset_dr, response)
 
     def enable_callback(self, request, response):
         self.get_logger().info("Enabling acoustics...")
@@ -131,18 +135,18 @@ class DvlSerialPythonNode(Node):
 
     def calibrate_callback(self, request, response):
         self.get_logger().info("Calibrating gyro...")
-        return self._trigger_command(b"wcg\n", self.timeout_calibrate_gyro, response)
+        return self._trigger_command("wcg", self.timeout_calibrate_gyro, response)
 
     def trigger_ping_callback(self, request, response):
         self.get_logger().info("Triggering ping...")
-        return self._trigger_command(b"wct\n", self.timeout_trigger_ping, response)
+        return self._trigger_command("wcx", self.timeout_trigger_ping, response)
 
     def get_config_callback(self, request, response):
         self.get_logger().info("Fetching configuration from DVL...")
         if hasattr(self, 'serial') and self.serial.is_open:
             self.wrc_event.clear()
             self.wrc_data = None
-            self.serial.write(b"wcc\n")
+            self.write_command("wcc")
             if self.wrc_event.wait(self.timeout_get_config) and self.wrc_data:
                 response.success = True
                 response.speed_of_sound = int(self.wrc_data['speed_of_sound'])
@@ -173,12 +177,29 @@ class DvlSerialPythonNode(Node):
             response.message = "Serial port not open"
         return response
 
-    def send_command_wait_ack(self, cmd: bytes, timeout: float = 1.0) -> bool:
-        self.ack_event.clear()
-        self.nak_event.clear()
-        self.serial.write(cmd)
-        # Wait until ack_event is set, or timeout expires
-        return self.ack_event.wait(timeout)
+    def write_command(self, cmd: str):
+        cmd = cmd.strip()
+        if '*' in cmd:
+            cmd = cmd.split('*')[0]
+        # Calculate CRC-8 checksum
+        crc = crc8_func(cmd.encode('utf-8'))
+        full_cmd = f"{cmd}*{crc:02x}\r\n"
+        self.get_logger().debug(f"Writing command to port: {full_cmd.strip()}")
+        self.serial.write(full_cmd.encode('utf-8'))
+        self.serial.flush()
+
+    def send_command_wait_ack(self, cmd: str, timeout: float = 1.0) -> bool:
+        self.command_success = False
+        self.command_event.clear()
+        self.wait_for_ack = True
+        self.write_command(cmd)
+        
+        success = False
+        if self.command_event.wait(timeout):
+            success = self.command_success
+            
+        self.wait_for_ack = False
+        return success
 
     def configure_dvl(self):
         self.get_logger().info("Flushing DVL RX buffer...")
@@ -187,14 +208,22 @@ class DvlSerialPythonNode(Node):
         self.serial.reset_input_buffer()
         
         # Request Version
-        self.serial.write(b"wcv\n")
+        self.write_command("wcv")
         time.sleep(0.1)
         
-        attempts = 25
+        # Request Product Details
+        self.write_command("wcw")
+        time.sleep(0.1)
+        
+        # Stop acoustics first to allow reliable command configuration
+        self.get_logger().info("Stopping acoustics initially for configuration...")
+        self.send_configuration(False)
+        
+        attempts = 5
         protocol_set = False
         for i in range(attempts):
             self.get_logger().info(f"Attempting to set DVL serial protocol ({i+1}/{attempts})")
-            if self.send_command_wait_ack(b"wcp,3\n", timeout=self.timeout_set_protocol):
+            if self.send_command_wait_ack("wcp,3", timeout=self.timeout_set_protocol):
                 protocol_set = True
                 break
             time.sleep(0.2)
@@ -202,11 +231,11 @@ class DvlSerialPythonNode(Node):
         if not protocol_set:
             self.get_logger().warn("Failed to set DVL protocol to 3. DVL might be ignoring ACKs or using older firmware.")
             
-        self.get_logger().info("Sending Configuration...")
+        self.get_logger().info("Sending final Configuration...")
         if self.send_configuration(self.enable_on_activate):
             self.get_logger().info("Configuration sequence complete and ACKed.")
         else:
-            self.get_logger().error("Configuration completely failed after all attempts.")
+            self.get_logger().warn("DVL configuration over serial timed out. This is expected if the DVL is wired for one-way telemetry (RX-only). Proceeding with active telemetry streaming!")
 
     def send_configuration(self, acoustic_enabled) -> bool:
         sos_str = f"{self.sos:g}"
@@ -216,24 +245,24 @@ class DvlSerialPythonNode(Node):
         periodic_str = "y" if self.periodic_cycling else "n"
         range_mode = self.range_mode
         
-        cmd1 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode},{periodic_str}\n"
-        cmd2 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode}\n"
-        cmd3 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str}\n"
+        cmd1 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode},{periodic_str}"
+        cmd2 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode}"
+        cmd3 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str}"
         
         config_set = False
-        attempts = 25
+        attempts = 20
         for i in range(attempts):
             self.get_logger().info(f"Attempting to configure DVL A50 ({i+1}/{attempts})")
             for cmd in [cmd1, cmd2, cmd3]:
                 self.get_logger().debug(f"Sending config command: {cmd.strip()}")
-                if self.send_command_wait_ack(cmd.encode('utf-8'), timeout=self.timeout_configure):
+                if self.send_command_wait_ack(cmd, timeout=self.timeout_configure):
                     config_set = True
                     break
                 time.sleep(0.1)
                 
             if config_set:
                 break
-            time.sleep(1.0)
+            time.sleep(0.2)
             
         return config_set
 
@@ -287,9 +316,17 @@ class DvlSerialPythonNode(Node):
             if not line:
                 continue
                 
-            if line.startswith("wr?") or line.startswith("wrn"):
-                self.get_logger().warn(f"DVL NAK/Error received: {line}")
-                self.nak_event.set()
+            if line.startswith("wr?") or line.startswith("wrn") or line.startswith("wr!"):
+                if line.startswith("wrn"):
+                    self.get_logger().warn(f"DVL NAK received: {line}")
+                elif line.startswith("wr!"):
+                    self.get_logger().warn(f"DVL Checksum error received: {line}")
+                else:
+                    self.get_logger().debug(f"DVL malformed request error received (noise): {line}")
+                
+                if self.wait_for_ack:
+                    self.command_success = False
+                    self.command_event.set()
                 continue
                 
             if not verify_checksum(line):
@@ -396,6 +433,13 @@ class DvlSerialPythonNode(Node):
                 else:
                     self.get_logger().warn(f"Failed to parse wrv sentence: {line}")
                     
+            elif line.startswith("wrw"):
+                data = parse_wrw(line)
+                if data:
+                    self.get_logger().info(f"DVL Product Info - Name: {data['name']}, Version: {data['version']}, ChipID: {data['chip_id']}, IP: {data['ip_address']}")
+                else:
+                    self.get_logger().warn(f"Failed to parse wrw sentence: {line}")
+                    
             elif line.startswith("wrc"):
                 data = parse_wrc(line)
                 if data:
@@ -403,11 +447,15 @@ class DvlSerialPythonNode(Node):
                     self.get_logger().info(f"DVL Configuration Received: {data}")
                     self.wrc_event.set()
                 self.get_logger().info(f"DVL Configuration ACK: {line}")
-                self.ack_event.set()
+                if self.wait_for_ack:
+                    self.command_success = True
+                    self.command_event.set()
 
             elif line.startswith("wra"):
                 self.get_logger().info(f"DVL Configuration ACK: {line}")
-                self.ack_event.set()
+                if self.wait_for_ack:
+                    self.command_success = True
+                    self.command_event.set()
                 
             else:
                 # Log unhandled valid messages at DEBUG level so they don't spam the terminal

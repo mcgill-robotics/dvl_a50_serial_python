@@ -97,15 +97,52 @@ def parse_wrp(sentence: str):
 def parse_wrv(sentence: str):
     """
     Parses a version report (wrv).
-    Format: wrv,[part_number],[version]*[checksum]
+    Format: wrv,[version]*[checksum]  (e.g., wrv,2.6.0)
+    Or format: wrv,[part_number],[version]*[checksum]
+    Or format: wrv,[major],[minor],[patch]*[checksum] (comma separated version, e.g., wrv,2,6,0)
+    Or format: wrv,[part_number],[major],[minor],[patch]*[checksum]
     """
     data_part = sentence.rsplit("*", 1)[0]
     parts = data_part.split(",")
-    if len(parts) < 3:
+    if len(parts) < 2:
         return None
+        
+    # Check if parts from index 1 to end are all numeric digits (major, minor, patch)
+    if len(parts) == 4 and all(p.isdigit() for p in parts[1:]):
+        return {
+            "part_number": "unknown",
+            "version": ".".join(parts[1:])
+        }
+    if len(parts) == 5 and all(p.isdigit() for p in parts[2:]):
+        return {
+            "part_number": parts[1],
+            "version": ".".join(parts[2:])
+        }
+        
+    if len(parts) == 2:
+        return {
+            "part_number": "unknown",
+            "version": parts[1]
+        }
     return {
         "part_number": parts[1],
-        "version": parts[2]
+        "version": parts[2] if len(parts) > 2 else "unknown"
+    }
+
+def parse_wrw(sentence: str):
+    """
+    Parses a product detail report (wrw).
+    Format: wrw,[name],[version],[chipID],[IP address]*[checksum]
+    """
+    data_part = sentence.rsplit("*", 1)[0]
+    parts = data_part.split(",")
+    if len(parts) < 4:
+        return None
+    return {
+        "name": parts[1],
+        "version": parts[2],
+        "chip_id": parts[3],
+        "ip_address": parts[4] if len(parts) > 4 else "unknown"
     }
 
 def parse_wrc(sentence: str):
