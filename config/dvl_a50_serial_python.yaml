@@ -9,6 +9,7 @@
     mounting_rotation_offset: 0.0
     range_mode: "auto"
     periodic_cycling_enabled: true
+    reset_dead_reckoning_on_startup: true
     
     topic_velocity: "velocity"
     topic_dead_reckoning: "dead_reckoning"

@@ -14,6 +14,33 @@ from dvl_msgs.msg import DVL, DVLDR, DVLBeam
 from dvl_msgs.srv import GetConfig
 from nav_msgs.msg import Odometry
 import tf_transformations
+from enum import Enum
+
+# DVL A50 Serial Protocol page: https://docs.waterlinked.com/dvl/dvl-serial-protocol/
+ 
+class DvlCommand(str, Enum):
+    GET_VERSION = "wcv"
+    GET_PRODUCT_DETAIL = "wcw"
+    SET_CONFIG = "wcs"
+    GET_CONFIG = "wcc"
+    RESET_DEAD_RECKONING = "wcr"
+    TRIGGER_PING = "wcx"
+    CALIBRATE_GYRO = "wcg"
+    SET_PROTOCOL = "wcp"
+
+class DvlResponse(str, Enum):
+    ACK = "wra"
+    NAK = "wrn"
+    ERR_CHECKSUM = "wr!"
+    ERR_MALFORMED = "wr?"
+    CONFIG = "wrc"
+    VELOCITY = "wrz"
+    VELOCITY_WATER_TRACK = "wrs"  # Can also be time status depending on command
+    TRANSDUCER = "wru"
+    DEAD_RECKONING = "wrp"
+    VERSION = "wrv"
+    PRODUCT_DETAIL = "wrw"
+
 
 class DvlSerialPythonNode(Node):
     def __init__(self):
@@ -28,6 +55,7 @@ class DvlSerialPythonNode(Node):
         self.declare_parameter('range_mode', 'auto')
         self.declare_parameter('periodic_cycling_enabled', True)
         self.declare_parameter('enable_on_activate', True)
+        self.declare_parameter('reset_dead_reckoning_on_startup', True)
         self.declare_parameter('topic_velocity', 'velocity')
         self.declare_parameter('topic_dead_reckoning', 'dead_reckoning')
         self.declare_parameter('topic_odometry', 'odometry')
@@ -47,6 +75,7 @@ class DvlSerialPythonNode(Node):
         self.range_mode = self.get_parameter('range_mode').value
         self.periodic_cycling = self.get_parameter('periodic_cycling_enabled').value
         self.enable_on_activate = self.get_parameter('enable_on_activate').value
+        self.reset_on_startup = self.get_parameter('reset_dead_reckoning_on_startup').value
         
         self.timeout_configure = self.get_parameter('timeout_configure_ms').value / 1000.0
         self.timeout_reset_dr = self.get_parameter('timeout_reset_dead_reckoning_ms').value / 1000.0
@@ -102,16 +131,24 @@ class DvlSerialPythonNode(Node):
         self.wrc_event = threading.Event()
         self.wrc_data = None
         
+        self.is_configured = False
+        
         # Start reading first so we can catch ACKs during configuration
         self.read_thread = threading.Thread(target=self.read_loop)
         self.read_thread.start()
         
-        self.configure_dvl()
+        self.config_thread = threading.Thread(target=self.run_configuration_sequence)
+        self.config_thread.start()
+        
         self.add_on_set_parameters_callback(self.parameters_callback)
+
+    def run_configuration_sequence(self):
+        self.configure_dvl()
+        self.is_configured = True
 
     def reset_dr_callback(self, request, response):
         self.get_logger().info("Resetting dead reckoning...")
-        return self._trigger_command("wcr", self.timeout_reset_dr, response)
+        return self._trigger_command(DvlCommand.RESET_DEAD_RECKONING, self.timeout_reset_dr, response)
 
     def enable_callback(self, request, response):
         self.get_logger().info("Enabling acoustics...")
@@ -135,18 +172,18 @@ class DvlSerialPythonNode(Node):
 
     def calibrate_callback(self, request, response):
         self.get_logger().info("Calibrating gyro...")
-        return self._trigger_command("wcg", self.timeout_calibrate_gyro, response)
+        return self._trigger_command(DvlCommand.CALIBRATE_GYRO, self.timeout_calibrate_gyro, response)
 
     def trigger_ping_callback(self, request, response):
         self.get_logger().info("Triggering ping...")
-        return self._trigger_command("wcx", self.timeout_trigger_ping, response)
+        return self._trigger_command(DvlCommand.TRIGGER_PING, self.timeout_trigger_ping, response)
 
     def get_config_callback(self, request, response):
         self.get_logger().info("Fetching configuration from DVL...")
         if hasattr(self, 'serial') and self.serial.is_open:
             self.wrc_event.clear()
             self.wrc_data = None
-            self.write_command("wcc")
+            self.write_command(DvlCommand.GET_CONFIG)
             if self.wrc_event.wait(self.timeout_get_config) and self.wrc_data:
                 response.success = True
                 response.speed_of_sound = int(self.wrc_data['speed_of_sound'])
@@ -208,11 +245,11 @@ class DvlSerialPythonNode(Node):
         self.serial.reset_input_buffer()
         
         # Request Version
-        self.write_command("wcv")
+        self.write_command(DvlCommand.GET_VERSION)
         time.sleep(0.1)
         
         # Request Product Details
-        self.write_command("wcw")
+        self.write_command(DvlCommand.GET_PRODUCT_DETAIL)
         time.sleep(0.1)
         
         # Stop acoustics first to allow reliable command configuration
@@ -223,7 +260,7 @@ class DvlSerialPythonNode(Node):
         protocol_set = False
         for i in range(attempts):
             self.get_logger().info(f"Attempting to set DVL serial protocol ({i+1}/{attempts})")
-            if self.send_command_wait_ack("wcp,3", timeout=self.timeout_set_protocol):
+            if self.send_command_wait_ack(f"{DvlCommand.SET_PROTOCOL},3", timeout=self.timeout_set_protocol):
                 protocol_set = True
                 break
             time.sleep(0.2)
@@ -232,10 +269,25 @@ class DvlSerialPythonNode(Node):
             self.get_logger().warn("Failed to set DVL protocol to 3. DVL might be ignoring ACKs or using older firmware.")
             
         self.get_logger().info("Sending final Configuration...")
-        if self.send_configuration(self.enable_on_activate):
-            self.get_logger().info("Configuration sequence complete and ACKed.")
-        else:
-            self.get_logger().warn("DVL configuration over serial timed out. This is expected if the DVL is wired for one-way telemetry (RX-only). Proceeding with active telemetry streaming!")
+        
+        while rclpy.ok() and self.running:
+            if self.send_configuration(self.enable_on_activate):
+                self.get_logger().info("Configuration sequence complete and ACKed.")
+                
+                if self.reset_on_startup:
+                    self.get_logger().info("Resetting dead reckoning on startup as requested...")
+                    if self.send_command_wait_ack(DvlCommand.RESET_DEAD_RECKONING, timeout=self.timeout_reset_dr):
+                        self.get_logger().info("Dead reckoning successfully reset. DVL is ready!")
+                        break
+                    else:
+                        self.get_logger().warn("Failed to receive ACK for dead reckoning reset. Retrying...")
+                        time.sleep(1.0)
+                else:
+                    self.get_logger().info("DVL is ready!")
+                    break
+            else:
+                self.get_logger().warn("DVL configuration over serial timed out. Retrying...")
+                time.sleep(1.0)
 
     def send_configuration(self, acoustic_enabled) -> bool:
         sos_str = f"{self.sos:g}"
@@ -245,9 +297,9 @@ class DvlSerialPythonNode(Node):
         periodic_str = "y" if self.periodic_cycling else "n"
         range_mode = self.range_mode
         
-        cmd1 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode},{periodic_str}"
-        cmd2 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode}"
-        cmd3 = f"wcs,{sos_str},{offset_str},{acoustic_str},{dark_mode_str}"
+        cmd1 = f"{DvlCommand.SET_CONFIG},{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode},{periodic_str}"
+        cmd2 = f"{DvlCommand.SET_CONFIG},{sos_str},{offset_str},{acoustic_str},{dark_mode_str},{range_mode}"
+        cmd3 = f"{DvlCommand.SET_CONFIG},{sos_str},{offset_str},{acoustic_str},{dark_mode_str}"
         
         config_set = False
         attempts = 20
@@ -316,10 +368,10 @@ class DvlSerialPythonNode(Node):
             if not line:
                 continue
                 
-            if line.startswith("wr?") or line.startswith("wrn") or line.startswith("wr!"):
-                if line.startswith("wrn"):
+            if line.startswith(DvlResponse.ERR_MALFORMED) or line.startswith(DvlResponse.NAK) or line.startswith(DvlResponse.ERR_CHECKSUM):
+                if line.startswith(DvlResponse.NAK):
                     self.get_logger().warn(f"DVL NAK received: {line}")
-                elif line.startswith("wr!"):
+                elif line.startswith(DvlResponse.ERR_CHECKSUM):
                     self.get_logger().warn(f"DVL Checksum error received: {line}")
                 else:
                     self.get_logger().debug(f"DVL malformed request error received (noise): {line}")
@@ -333,7 +385,7 @@ class DvlSerialPythonNode(Node):
                 self.get_logger().debug(f"CRC Mismatch or malformed message: {line}")
                 continue
                 
-            if line.startswith("wru"):
+            if line.startswith(DvlResponse.TRANSDUCER):
                 data = parse_wru(line)
                 if data and 0 <= data['id'] < 4:
                     b = DVLBeam()
@@ -345,9 +397,9 @@ class DvlSerialPythonNode(Node):
                     b.valid = (b.distance != -1.0)
                     self.current_beams[data['id']] = b
                     
-            elif line.startswith("wrp"):
+            elif line.startswith(DvlResponse.DEAD_RECKONING):
                 data = parse_wrp(line)
-                if data:
+                if data and self.is_configured:
                     dr_msg = DVLDR()
                     dr_msg.header.stamp = self.get_clock().now().to_msg()
                     dr_msg.header.frame_id = self.frame
@@ -383,12 +435,12 @@ class DvlSerialPythonNode(Node):
                     
                     self.odom_pub.publish(self.odom_msg)
 
-            elif line.startswith("wrz"):
+            elif line.startswith(DvlResponse.VELOCITY):
                 if first_velocity:
-                    self.get_logger().info("First velocity report (wrz) received! Data is streaming correctly.")
+                    self.get_logger().info("First velocity report received! Data is streaming correctly.")
                     first_velocity = False
                 data = parse_wrz(line)
-                if data:
+                if data and self.is_configured:
                     msg = DVL()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     msg.header.frame_id = self.frame
@@ -426,21 +478,21 @@ class DvlSerialPythonNode(Node):
                 else:
                     self.get_logger().warn(f"Failed to parse wrz sentence: {line}")
 
-            elif line.startswith("wrv"):
+            elif line.startswith(DvlResponse.VERSION):
                 data = parse_wrv(line)
                 if data:
                     self.get_logger().info(f"DVL Connected. Part Number: {data['part_number']}, Firmware Version: {data['version']}")
                 else:
-                    self.get_logger().warn(f"Failed to parse wrv sentence: {line}")
+                    self.get_logger().warn(f"Failed to parse version sentence: {line}")
                     
-            elif line.startswith("wrw"):
+            elif line.startswith(DvlResponse.PRODUCT_DETAIL):
                 data = parse_wrw(line)
                 if data:
                     self.get_logger().info(f"DVL Product Info - Name: {data['name']}, Version: {data['version']}, ChipID: {data['chip_id']}, IP: {data['ip_address']}")
                 else:
-                    self.get_logger().warn(f"Failed to parse wrw sentence: {line}")
+                    self.get_logger().warn(f"Failed to parse product detail sentence: {line}")
                     
-            elif line.startswith("wrc"):
+            elif line.startswith(DvlResponse.CONFIG):
                 data = parse_wrc(line)
                 if data:
                     self.wrc_data = data
@@ -451,7 +503,7 @@ class DvlSerialPythonNode(Node):
                     self.command_success = True
                     self.command_event.set()
 
-            elif line.startswith("wra"):
+            elif line.startswith(DvlResponse.ACK):
                 self.get_logger().info(f"DVL Configuration ACK: {line}")
                 if self.wait_for_ack:
                     self.command_success = True
