@@ -7,7 +7,7 @@
     speed_of_sound: 1500.0
     led_enabled: true
     mounting_rotation_offset: 0.0
-    range_mode: "0<=1"
+    range_mode: "0<=2"
     periodic_cycling_enabled: true
     reset_dead_reckoning_on_startup: true
     
