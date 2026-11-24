@@ -17,8 +17,17 @@ import tf_transformations
 from enum import Enum
 
 # DVL A50 Serial Protocol page: https://docs.waterlinked.com/dvl/dvl-serial-protocol/
- 
-class DvlCommand(str, Enum):
+
+class _WireEnum(str, Enum):
+    # Python 3.11+ formats (str, Enum) members as "ClassName.MEMBER" in f-strings,
+    # which put "DvlCommand.SET_CONFIG,..." on the wire instead of "wcs,...".
+    def __str__(self):
+        return self.value
+
+    def __format__(self, spec):
+        return format(self.value, spec)
+
+class DvlCommand(_WireEnum):
     GET_VERSION = "wcv"
     GET_PRODUCT_DETAIL = "wcw"
     SET_CONFIG = "wcs"
@@ -28,7 +37,7 @@ class DvlCommand(str, Enum):
     CALIBRATE_GYRO = "wcg"
     SET_PROTOCOL = "wcp"
 
-class DvlResponse(str, Enum):
+class DvlResponse(_WireEnum):
     ACK = "wra"
     NAK = "wrn"
     ERR_CHECKSUM = "wr!"
